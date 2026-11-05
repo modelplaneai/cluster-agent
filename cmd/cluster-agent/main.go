@@ -119,8 +119,12 @@ func main() {
 	_, err = claims.AddEventHandler(allocation.ForgetDeleted(record))
 	kctx.FatalIfErrorf(err, "cannot add ResourceClaim event handler")
 
-	kctx.FatalIfErrorf(poolobservation.Setup(mgr, record, log, flags.ObservationDelay), "cannot set up PoolObservation controller")
-	kctx.FatalIfErrorf(replicaobservation.Setup(mgr, record, log), "cannot set up ReplicaObservation controller")
+	kctx.FatalIfErrorf(poolobservation.Setup(mgr, record, flags.ObservationDelay,
+		poolobservation.WithLogger(log.With("controller", "poolobservation")),
+	), "cannot set up PoolObservation controller")
+	kctx.FatalIfErrorf(replicaobservation.Setup(mgr, record,
+		replicaobservation.WithLogger(log.With("controller", "replicaobservation")),
+	), "cannot set up ReplicaObservation controller")
 
 	kctx.FatalIfErrorf(mgr.Start(ctx), "cannot run manager")
 }

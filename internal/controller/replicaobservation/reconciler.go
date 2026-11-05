@@ -111,8 +111,9 @@ func NewReconciler(c client.Client, record *allocation.Record, opts ...Reconcile
 }
 
 // Setup adds a ReplicaObservation controller to the manager. It reads
-// ResourceClaims through the supplied Record.
-func Setup(mgr ctrl.Manager, record *allocation.Record, log *slog.Logger) error {
+// ResourceClaims through the supplied Record, and configures its Reconciler
+// with the supplied options.
+func Setup(mgr ctrl.Manager, record *allocation.Record, opts ...ReconcilerOption) error {
 	c := mgr.GetClient()
 	err := ctrl.NewControllerManagedBy(mgr).
 		Named("replicaobservation").
@@ -126,7 +127,7 @@ func Setup(mgr ctrl.Manager, record *allocation.Record, log *slog.Logger) error 
 		// but the claim cache can lag the pod cache. Watching claims catches
 		// an allocation the pod's binding raced ahead of.
 		Watches(&resourcev1.ResourceClaim{}, handler.EnqueueRequestsFromMapFunc(ClaimRequests(c))).
-		Complete(NewReconciler(c, record, WithLogger(log.With("controller", "replicaobservation"))))
+		Complete(NewReconciler(c, record, opts...))
 	if err != nil {
 		return fmt.Errorf("cannot create controller: %w", err)
 	}

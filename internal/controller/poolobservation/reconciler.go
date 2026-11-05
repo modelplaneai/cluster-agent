@@ -112,8 +112,9 @@ func NewReconciler(c client.Client, record *allocation.Record, opts ...Reconcile
 // Setup adds a PoolObservation controller to the manager. The controller
 // observes every pool whenever an object it reads changes, but waits for the
 // supplied delay first, so that a burst of changes produces one observation
-// of each pool. It reads ResourceClaims through the supplied Record.
-func Setup(mgr ctrl.Manager, record *allocation.Record, log *slog.Logger, delay time.Duration) error {
+// of each pool. It reads ResourceClaims through the supplied Record, and
+// configures its Reconciler with the supplied options.
+func Setup(mgr ctrl.Manager, record *allocation.Record, delay time.Duration, opts ...ReconcilerOption) error {
 	c := mgr.GetClient()
 	enqueue := EnqueueAllAfter(c, delay)
 	err := ctrl.NewControllerManagedBy(mgr).
@@ -125,7 +126,7 @@ func Setup(mgr ctrl.Manager, record *allocation.Record, log *slog.Logger, delay 
 		Watches(&resourcev1.ResourceClaim{}, enqueue).
 		Watches(&corev1.Pod{}, enqueue).
 		Watches(&corev1.Event{}, enqueue).
-		Complete(NewReconciler(c, record, WithLogger(log.With("controller", "poolobservation"))))
+		Complete(NewReconciler(c, record, opts...))
 	if err != nil {
 		return fmt.Errorf("cannot create controller: %w", err)
 	}
