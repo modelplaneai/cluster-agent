@@ -283,8 +283,7 @@ spec:
                   schedulable:
                     description: |-
                       Schedulable counts the ready nodes that aren't cordoned, and carry no
-                      NoSchedule or NoExecute taint but nvidia.com/gpu with NoSchedule, which
-                      Modelplane's GPU pods tolerate.
+                      NoSchedule or NoExecute taint that Modelplane's pods don't tolerate.
                     format: int32
                     minimum: 0
                     type: integer
