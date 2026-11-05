@@ -54,6 +54,7 @@ type cli struct {
 	MetricsBindAddress      string        `default:":8080"                                                                                        help:"The address the metrics endpoint binds to."`
 	HealthProbeBindAddress  string        `default:":8081"                                                                                        help:"The address the health probe endpoint binds to."`
 	LeaderElectionNamespace string        `help:"The namespace of the Lease that elects one agent to run. Defaults to the agent's own namespace."`
+	ToleratedTaints         []string      `default:"nvidia.com/gpu:NoSchedule,amd.com/gpu:NoSchedule,modelplane.ai/cpu:NoSchedule"                help:"Taints Modelplane's pods tolerate, as key[=value]:effect. A taint without a value matches any value. A node with any other NoSchedule or NoExecute taint doesn't count as schedulable."`
 }
 
 func main() {
@@ -63,6 +64,13 @@ func main() {
 		kong.Description("Observe a Modelplane InferenceCluster and report what it sees."),
 		kong.UsageOnError(),
 	)
+
+	tolerations := make([]corev1.Toleration, len(flags.ToleratedTaints))
+	for i, s := range flags.ToleratedTaints {
+		t, err := pool.ParseToleration(s)
+		kctx.FatalIfErrorf(err, "cannot parse --tolerated-taints")
+		tolerations[i] = t
+	}
 
 	level := slog.LevelInfo
 	if flags.Debug {
@@ -120,6 +128,7 @@ func main() {
 	kctx.FatalIfErrorf(err, "cannot add ResourceClaim event handler")
 
 	kctx.FatalIfErrorf(poolobservation.Setup(mgr, record, flags.ObservationDelay,
+		poolobservation.WithPoolObserver(pool.NewObserver(pool.WithTolerations(tolerations))),
 		poolobservation.WithLogger(log.With("controller", "poolobservation")),
 	), "cannot set up PoolObservation controller")
 	kctx.FatalIfErrorf(replicaobservation.Setup(mgr, record,

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package pool observes a GPU pool: the nodes Modelplane labels with the
+// Package pool observes a pool: the nodes Modelplane labels with the
 // pool's name, the DRA devices they publish, and the pods waiting for them.
 package pool
 
@@ -27,10 +27,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	resourcev1 "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/dynamic-resource-allocation/cel"
 
 	"github.com/modelplaneai/cluster-agent/internal/dra"
@@ -39,10 +41,6 @@ import (
 // LabelPool is the node label Modelplane sets to the name of a node's pool.
 // Modelplane pins a pod to a pool with a node selector on it.
 const LabelPool = "modelplane.ai/pool"
-
-// TaintGPU is the taint Modelplane puts on the GPU pools it provisions. Its GPU
-// pods tolerate it with effect NoSchedule.
-const TaintGPU = "nvidia.com/gpu"
 
 // Cluster autoscaler pod event reasons. See
 // https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/FAQ.md#what-events-are-emitted-by-ca
@@ -111,8 +109,8 @@ type Nodes struct {
 	// Cordoned counts the nodes marked unschedulable, ready or not.
 	Cordoned int32
 
-	// Schedulable counts the nodes Modelplane's GPU pods can schedule onto.
-	// See IsSchedulable.
+	// Schedulable counts the nodes Modelplane's pods can schedule onto. See
+	// IsSchedulable.
 	Schedulable int32
 }
 
@@ -179,24 +177,39 @@ type Membership struct {
 	// Nodes is the set of the pool's nodes.
 	Nodes map[string]bool
 
-	// Schedulable is the set of the pool's nodes that Modelplane's GPU pods
-	// can schedule onto. See IsSchedulable.
+	// Schedulable is the set of the pool's nodes that Modelplane's pods can
+	// schedule onto. See IsSchedulable.
 	Schedulable map[string]bool
 }
 
 // An Observer observes pools.
 type Observer struct {
-	cel *cel.Cache
+	cel         *cel.Cache
+	tolerations []corev1.Toleration
+}
+
+// An ObserverOption configures an Observer.
+type ObserverOption func(*Observer)
+
+// WithTolerations sets the tolerations Modelplane's pods carry. The Observer
+// counts a node as schedulable only if they tolerate its taints. It tolerates
+// no taints by default.
+func WithTolerations(t []corev1.Toleration) ObserverOption {
+	return func(o *Observer) { o.tolerations = t }
 }
 
 // NewObserver returns an Observer.
-func NewObserver() *Observer {
+func NewObserver(opts ...ObserverOption) *Observer {
 	// Enable every CEL feature so the Observer can compile any expression
 	// the API server accepted.
-	return &Observer{cel: cel.NewCache(celCacheSize, cel.Features{
+	o := &Observer{cel: cel.NewCache(celCacheSize, cel.Features{
 		EnableConsumableCapacity: true,
 		EnableListTypeAttributes: true,
 	})}
+	for _, fn := range opts {
+		fn(o)
+	}
+	return o
 }
 
 // ObservePool returns what's true of the named pool. A pool's nodes are those
@@ -208,7 +221,7 @@ func (o *Observer) ObservePool(ctx context.Context, name string, in Inputs) (Obs
 			nodes = append(nodes, n)
 		}
 	}
-	m := Members(nodes)
+	m := Members(nodes, o.tolerations)
 	devices := dra.Devices(in.Slices)
 
 	byClass, err := o.DevicesByClass(ctx, devices, in.Classes, Allocated(in.Claims), m)
@@ -216,7 +229,7 @@ func (o *Observer) ObservePool(ctx context.Context, name string, in Inputs) (Obs
 		return Observation{}, err
 	}
 	return Observation{
-		Nodes:             CountNodes(nodes),
+		Nodes:             CountNodes(nodes, o.tolerations),
 		Devices:           byClass,
 		Free:              Free(byClass, m),
 		LastAllocation:    LastAllocation(in.Claims, in.AllocatedAt, devices, m),
@@ -227,20 +240,21 @@ func (o *Observer) ObservePool(ctx context.Context, name string, in Inputs) (Obs
 }
 
 // Members returns the supplied nodes as a pool's members, and which of them
-// are schedulable.
-func Members(nodes []corev1.Node) Membership {
+// are schedulable by pods with the supplied tolerations.
+func Members(nodes []corev1.Node, ts []corev1.Toleration) Membership {
 	m := Membership{Nodes: map[string]bool{}, Schedulable: map[string]bool{}}
 	for _, n := range nodes {
 		m.Nodes[n.Name] = true
-		if IsSchedulable(n) {
+		if IsSchedulable(n, ts) {
 			m.Schedulable[n.Name] = true
 		}
 	}
 	return m
 }
 
-// CountNodes counts a pool's nodes.
-func CountNodes(nodes []corev1.Node) Nodes {
+// CountNodes counts a pool's nodes, counting a node as schedulable if pods with
+// the supplied tolerations can schedule onto it.
+func CountNodes(nodes []corev1.Node, ts []corev1.Toleration) Nodes {
 	c := Nodes{}
 	for _, n := range nodes {
 		c.Total++
@@ -250,7 +264,7 @@ func CountNodes(nodes []corev1.Node) Nodes {
 		if IsReady(n) {
 			c.Ready++
 		}
-		if IsSchedulable(n) {
+		if IsSchedulable(n, ts) {
 			c.Schedulable++
 		}
 	}
@@ -453,26 +467,49 @@ func IsReady(n corev1.Node) bool {
 	return false
 }
 
-// IsSchedulable returns true if Modelplane's GPU pods can schedule onto the
-// node: it's ready, it isn't cordoned, and every NoSchedule or NoExecute taint
-// it carries is one they tolerate.
-func IsSchedulable(n corev1.Node) bool {
+// IsSchedulable returns true if pods with the supplied tolerations can
+// schedule onto the node: it's ready, it isn't cordoned, and every NoSchedule
+// or NoExecute taint it carries is one they tolerate.
+func IsSchedulable(n corev1.Node, ts []corev1.Toleration) bool {
 	if !IsReady(n) || n.Spec.Unschedulable {
 		return false
 	}
-	for _, t := range n.Spec.Taints {
-		if t.Effect == corev1.TaintEffectPreferNoSchedule {
+	for _, taint := range n.Spec.Taints {
+		if taint.Effect == corev1.TaintEffectPreferNoSchedule {
 			continue
 		}
-		// compose-model-replica gives Modelplane's GPU pods this one
-		// toleration (_GPU_TOLERATION in
-		// functions/compose-model-replica/function/backends/base.py).
-		if t.Key == TaintGPU && t.Effect == corev1.TaintEffectNoSchedule {
-			continue
+		// ToleratesTaint only logs when comparing a Lt or Gt toleration's
+		// value, which it won't do with comparison operators disabled.
+		if !slices.ContainsFunc(ts, func(t corev1.Toleration) bool { return t.ToleratesTaint(logr.Discard(), &taint, false) }) {
+			return false
 		}
-		return false
 	}
 	return true
+}
+
+// ParseToleration parses a toleration of the taints written key[=value]:effect.
+// The toleration tolerates taints with the key and effect. It tolerates only
+// the value if there is one, and any value if there isn't. The effect must be
+// NoSchedule or NoExecute, the effects IsSchedulable considers.
+func ParseToleration(s string) (corev1.Toleration, error) {
+	kv, effect, ok := strings.Cut(s, ":")
+	if !ok {
+		return corev1.Toleration{}, fmt.Errorf("toleration %q has no effect, want key[=value]:effect", s)
+	}
+	t := corev1.Toleration{Key: kv, Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffect(effect)}
+	if key, value, ok := strings.Cut(kv, "="); ok {
+		t = corev1.Toleration{Key: key, Operator: corev1.TolerationOpEqual, Value: value, Effect: t.Effect}
+	}
+	if errs := validation.IsQualifiedName(t.Key); len(errs) > 0 {
+		return corev1.Toleration{}, fmt.Errorf("toleration %q has an invalid key: %s", s, strings.Join(errs, ", "))
+	}
+	if errs := validation.IsValidLabelValue(t.Value); len(errs) > 0 {
+		return corev1.Toleration{}, fmt.Errorf("toleration %q has an invalid value: %s", s, strings.Join(errs, ", "))
+	}
+	if t.Effect != corev1.TaintEffectNoSchedule && t.Effect != corev1.TaintEffectNoExecute {
+		return corev1.Toleration{}, fmt.Errorf("toleration %q has an invalid effect, want NoSchedule or NoExecute", s)
+	}
+	return t, nil
 }
 
 // IsUnschedulable returns true if the scheduler couldn't find a node for the

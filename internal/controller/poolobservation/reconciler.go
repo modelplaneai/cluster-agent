@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package poolobservation reports the state of a GPU pool in the status of a
+// Package poolobservation reports the state of a pool in the status of a
 // PoolObservation.
 package poolobservation
 
@@ -57,7 +57,7 @@ const (
 	FieldOwner = "cluster-agent.modelplane.ai"
 )
 
-// A PoolObserver observes a GPU pool. It must not modify its inputs, which
+// A PoolObserver observes a pool. It must not modify its inputs, which
 // the Reconciler reads straight from its cache.
 type PoolObserver interface {
 	ObservePool(ctx context.Context, name string, in pool.Inputs) (pool.Observation, error)
@@ -71,7 +71,7 @@ func (fn PoolObserverFn) ObservePool(ctx context.Context, name string, in pool.I
 	return fn(ctx, name, in)
 }
 
-// A Reconciler reports the state of a GPU pool in the status of a
+// A Reconciler reports the state of a pool in the status of a
 // PoolObservation.
 type Reconciler struct {
 	client   client.Client
@@ -89,7 +89,7 @@ func WithLogger(l *slog.Logger) ReconcilerOption {
 }
 
 // WithPoolObserver sets how the Reconciler observes pools. It uses a
-// pool.Observer by default.
+// pool.Observer that tolerates no taints by default.
 func WithPoolObserver(o PoolObserver) ReconcilerOption {
 	return func(r *Reconciler) { r.observer = o }
 }
@@ -156,7 +156,7 @@ func EnqueueAllAfter(c client.Reader, delay time.Duration) handler.Funcs {
 	}
 }
 
-// Reconcile observes a GPU pool and reports it in the status of the requested
+// Reconcile observes a pool and reports it in the status of the requested
 // PoolObservation.
 func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	log := r.log.With("request", req)

@@ -13,6 +13,14 @@ debug: false
 # Changes made while waiting are observed together.
 observationDelay: 10s
 
+# Taints Modelplane's pods tolerate, as key[=value]:effect. A taint without a
+# value matches any value. A node with any other NoSchedule or NoExecute taint
+# doesn't count as schedulable.
+toleratedTaints:
+- nvidia.com/gpu:NoSchedule
+- amd.com/gpu:NoSchedule
+- modelplane.ai/cpu:NoSchedule
+
 # The agent caches the nodes, pods and ResourceSlices it observes, so its
 # memory grows with the cluster. It uses about 50Mi on a cluster with nothing
 # to observe. There's no limit by default.

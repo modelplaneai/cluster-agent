@@ -50,6 +50,10 @@ import (
 // pool, pods of a replica and the cluster autoscaler's events, all without
 // managed fields.
 
+// The snapshots' GPU node carries the nvidia.com/gpu taint, which Modelplane's
+// pods tolerate.
+var gpuTolerations = []corev1.Toleration{{Key: "nvidia.com/gpu", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule}}
+
 var equateQuantities = cmp.Comparer(func(a, b resource.Quantity) bool { return a.Cmp(b) == 0 })
 
 // The attributes every L4 on the GPU node agrees on.
@@ -209,7 +213,7 @@ func TestObservePool(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			before := deepCopy(tc.args.in)
-			got, err := NewObserver().ObservePool(t.Context(), tc.args.pool, tc.args.in)
+			got, err := NewObserver(WithTolerations(gpuTolerations)).ObservePool(t.Context(), tc.args.pool, tc.args.in)
 			if diff := cmp.Diff(nil, err, cmpopts.EquateErrors()); diff != "" {
 				t.Errorf("\n%s\nObservePool(...): -want error, +got error:\n%s", tc.reason, diff)
 			}
@@ -434,57 +438,165 @@ func TestCountNodes(t *testing.T) {
 	ready := corev1.NodeStatus{Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}}
 	notReady := corev1.NodeStatus{Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionFalse}}}
 
+	type args struct {
+		nodes       []corev1.Node
+		tolerations []corev1.Toleration
+	}
+
 	cases := map[string]struct {
 		reason string
-		nodes  []corev1.Node
+		args   args
 		want   Nodes
 	}{
 		"States": {
 			reason: "Each node should count by whether it's ready and cordoned.",
-			nodes: []corev1.Node{
-				{ObjectMeta: metav1.ObjectMeta{Name: "ready"}, Status: ready},
-				{ObjectMeta: metav1.ObjectMeta{Name: "cordoned"}, Spec: corev1.NodeSpec{Unschedulable: true}, Status: ready},
-				{ObjectMeta: metav1.ObjectMeta{Name: "draining"}, Spec: corev1.NodeSpec{Unschedulable: true}, Status: notReady},
-				{ObjectMeta: metav1.ObjectMeta{Name: "no-condition"}},
+			args: args{
+				nodes: []corev1.Node{
+					{ObjectMeta: metav1.ObjectMeta{Name: "ready"}, Status: ready},
+					{ObjectMeta: metav1.ObjectMeta{Name: "cordoned"}, Spec: corev1.NodeSpec{Unschedulable: true}, Status: ready},
+					{ObjectMeta: metav1.ObjectMeta{Name: "draining"}, Spec: corev1.NodeSpec{Unschedulable: true}, Status: notReady},
+					{ObjectMeta: metav1.ObjectMeta{Name: "no-condition"}},
+				},
 			},
 			want: Nodes{Total: 4, Ready: 2, Cordoned: 2, Schedulable: 1},
 		},
 		"Taints": {
-			reason: "A ready node should be schedulable only if Modelplane's GPU pods tolerate every NoSchedule and NoExecute taint it carries.",
-			nodes: []corev1.Node{
-				{
-					ObjectMeta: metav1.ObjectMeta{Name: "gpu-taint"},
-					Spec:       corev1.NodeSpec{Taints: []corev1.Taint{{Key: "nvidia.com/gpu", Value: "true", Effect: corev1.TaintEffectNoSchedule}}},
-					Status:     ready,
+			reason: "A ready node should be schedulable only if the tolerations tolerate every NoSchedule and NoExecute taint it carries.",
+			args: args{
+				nodes: []corev1.Node{
+					{
+						ObjectMeta: metav1.ObjectMeta{Name: "nvidia-gpu"},
+						Spec:       corev1.NodeSpec{Taints: []corev1.Taint{{Key: "nvidia.com/gpu", Value: "true", Effect: corev1.TaintEffectNoSchedule}}},
+						Status:     ready,
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{Name: "amd-gpu"},
+						Spec:       corev1.NodeSpec{Taints: []corev1.Taint{{Key: "amd.com/gpu", Value: "present", Effect: corev1.TaintEffectNoSchedule}}},
+						Status:     ready,
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{Name: "cpu"},
+						Spec:       corev1.NodeSpec{Taints: []corev1.Taint{{Key: "modelplane.ai/cpu", Value: "true", Effect: corev1.TaintEffectNoSchedule}}},
+						Status:     ready,
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{Name: "cpu-other-value"},
+						Spec:       corev1.NodeSpec{Taints: []corev1.Taint{{Key: "modelplane.ai/cpu", Value: "false", Effect: corev1.TaintEffectNoSchedule}}},
+						Status:     ready,
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{Name: "prefer-no-schedule"},
+						Spec:       corev1.NodeSpec{Taints: []corev1.Taint{{Key: "DeletionCandidateOfClusterAutoscaler", Effect: corev1.TaintEffectPreferNoSchedule}}},
+						Status:     ready,
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{Name: "being-removed"},
+						Spec: corev1.NodeSpec{Taints: []corev1.Taint{
+							{Key: "nvidia.com/gpu", Value: "true", Effect: corev1.TaintEffectNoSchedule},
+							{Key: "ToBeDeletedByClusterAutoscaler", Effect: corev1.TaintEffectNoSchedule},
+						}},
+						Status: ready,
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{Name: "gpu-no-execute"},
+						Spec:       corev1.NodeSpec{Taints: []corev1.Taint{{Key: "nvidia.com/gpu", Effect: corev1.TaintEffectNoExecute}}},
+						Status:     ready,
+					},
 				},
-				{
-					ObjectMeta: metav1.ObjectMeta{Name: "prefer-no-schedule"},
-					Spec:       corev1.NodeSpec{Taints: []corev1.Taint{{Key: "DeletionCandidateOfClusterAutoscaler", Effect: corev1.TaintEffectPreferNoSchedule}}},
-					Status:     ready,
-				},
-				{
-					ObjectMeta: metav1.ObjectMeta{Name: "being-removed"},
-					Spec: corev1.NodeSpec{Taints: []corev1.Taint{
-						{Key: "nvidia.com/gpu", Value: "true", Effect: corev1.TaintEffectNoSchedule},
-						{Key: "ToBeDeletedByClusterAutoscaler", Effect: corev1.TaintEffectNoSchedule},
-					}},
-					Status: ready,
-				},
-				{
-					ObjectMeta: metav1.ObjectMeta{Name: "gpu-no-execute"},
-					Spec:       corev1.NodeSpec{Taints: []corev1.Taint{{Key: "nvidia.com/gpu", Effect: corev1.TaintEffectNoExecute}}},
-					Status:     ready,
+				tolerations: []corev1.Toleration{
+					{Key: "nvidia.com/gpu", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule},
+					{Key: "amd.com/gpu", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule},
+					{Key: "modelplane.ai/cpu", Operator: corev1.TolerationOpEqual, Value: "true", Effect: corev1.TaintEffectNoSchedule},
 				},
 			},
-			want: Nodes{Total: 4, Ready: 4, Schedulable: 2},
+			want: Nodes{Total: 7, Ready: 7, Schedulable: 4},
+		},
+		"NoTolerations": {
+			reason: "A ready node with a NoSchedule taint shouldn't be schedulable without tolerations.",
+			args: args{
+				nodes: []corev1.Node{
+					{
+						ObjectMeta: metav1.ObjectMeta{Name: "nvidia-gpu"},
+						Spec:       corev1.NodeSpec{Taints: []corev1.Taint{{Key: "nvidia.com/gpu", Value: "true", Effect: corev1.TaintEffectNoSchedule}}},
+						Status:     ready,
+					},
+				},
+			},
+			want: Nodes{Total: 1, Ready: 1},
 		},
 	}
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			got := CountNodes(tc.nodes)
+			got := CountNodes(tc.args.nodes, tc.args.tolerations)
 			if diff := cmp.Diff(tc.want, got); diff != "" {
 				t.Errorf("\n%s\nCountNodes(...): -want, +got:\n%s", tc.reason, diff)
+			}
+		})
+	}
+}
+
+func TestParseToleration(t *testing.T) {
+	type want struct {
+		t   corev1.Toleration
+		err error
+	}
+
+	cases := map[string]struct {
+		reason string
+		s      string
+		want   want
+	}{
+		"AnyValue": {
+			reason: "A taint without a value should parse as a toleration of any value.",
+			s:      "nvidia.com/gpu:NoSchedule",
+			want:   want{t: corev1.Toleration{Key: "nvidia.com/gpu", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule}},
+		},
+		"Value": {
+			reason: "A taint with a value should parse as a toleration of only that value.",
+			s:      "modelplane.ai/cpu=true:NoExecute",
+			want:   want{t: corev1.Toleration{Key: "modelplane.ai/cpu", Operator: corev1.TolerationOpEqual, Value: "true", Effect: corev1.TaintEffectNoExecute}},
+		},
+		"EmptyValue": {
+			reason: "A taint with an empty value should parse as a toleration of only the empty value.",
+			s:      "dedicated=:NoSchedule",
+			want:   want{t: corev1.Toleration{Key: "dedicated", Operator: corev1.TolerationOpEqual, Effect: corev1.TaintEffectNoSchedule}},
+		},
+		"PreferNoSchedule": {
+			reason: "A taint with effect PreferNoSchedule should be an error, because it never makes a node unschedulable.",
+			s:      "nvidia.com/gpu:PreferNoSchedule",
+			want:   want{err: cmpopts.AnyError},
+		},
+		"NoEffect": {
+			reason: "A taint without an effect should be an error.",
+			s:      "nvidia.com/gpu",
+			want:   want{err: cmpopts.AnyError},
+		},
+		"InvalidEffect": {
+			reason: "A taint with an effect Kubernetes doesn't define should be an error.",
+			s:      "nvidia.com/gpu:noschedule",
+			want:   want{err: cmpopts.AnyError},
+		},
+		"InvalidKey": {
+			reason: "A taint with a key that isn't a qualified name should be an error.",
+			s:      ":NoSchedule",
+			want:   want{err: cmpopts.AnyError},
+		},
+		"InvalidValue": {
+			reason: "A taint with a value that isn't a valid label value should be an error.",
+			s:      "nvidia.com/gpu=a/b:NoSchedule",
+			want:   want{err: cmpopts.AnyError},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got, err := ParseToleration(tc.s)
+			if diff := cmp.Diff(tc.want.err, err, cmpopts.EquateErrors()); diff != "" {
+				t.Errorf("\n%s\nParseToleration(%q): -want error, +got error:\n%s", tc.reason, tc.s, diff)
+			}
+			if diff := cmp.Diff(tc.want.t, got); diff != "" {
+				t.Errorf("\n%s\nParseToleration(%q): -want, +got:\n%s", tc.reason, tc.s, diff)
 			}
 		})
 	}
